@@ -3,6 +3,7 @@ import os
 import random
 import shutil
 import time
+import math
 import warnings
 
 import torch
@@ -16,6 +17,8 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+
+import half_helpers as tools
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -61,7 +64,10 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
-
+parser.add_argument('--half', action='store_true', default=False,
+                    help='enable half precision training')
+parser.add_argument('--static_loss_scale', type=float, default=128, metavar='L',
+                    help='loss scaling constant when half precision mode is used')
 best_prec1 = 0
 
 
@@ -83,6 +89,9 @@ def main():
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
 
+    tools.set_use_gpu(True)
+    tools.set_use_half(args.half)
+
     args.distributed = args.world_size > 1
 
     if args.distributed:
@@ -94,7 +103,7 @@ def main():
         print("=> using pre-trained model '{}'".format(args.arch))
         model = models.__dict__[args.arch](pretrained=True)
     else:
-        print("=> creating model '{}'".format(args.arch))
+        print("=> creating model '{}' (half: {})".format(args.arch, args.half))
         model = models.__dict__[args.arch]()
 
     if args.gpu is not None:
@@ -109,12 +118,16 @@ def main():
         else:
             model = torch.nn.DataParallel(model).cuda()
 
+    model = tools.enable_half(model)
+
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = tools.enable_half(nn.CrossEntropyLoss().cuda(args.gpu))
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
+
+    optimizer = tools.OptimizerAdapter(optimizer, half=tools.use_half(), static_loss_scale=args.static_loss_scale)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -199,22 +212,35 @@ def train(train_loader, model, criterion, optimizer, epoch):
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+    compute_time = AverageMeter()
 
     # switch to train mode
     model.train()
+    count = 0
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
+        input = tools.enable_half(input)
+        target = tools.enable_half(target)
 
         if args.gpu is not None:
             input = input.cuda(args.gpu, non_blocking=True)
+
         target = target.cuda(args.gpu, non_blocking=True)
 
+        compute_start = time.time()
         # compute output
         output = model(input)
         loss = criterion(output, target)
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        optimizer.backward(loss)
+        optimizer.step()
+        compute_end = time.time()
+        compute_time.update(compute_end - compute_start)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output, target, topk=(1, 5))
@@ -222,24 +248,23 @@ def train(train_loader, model, criterion, optimizer, epoch):
         top1.update(prec1[0], input.size(0))
         top5.update(prec5[0], input.size(0))
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
+        #'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+        #'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'
+
         if i % args.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+            print('Epoch: [{0}][{1:4d}/{2}] '
+                  'ComputeT {compute_time.val:.4f} (avg:{compute_time.avg:.4f}, sd:{compute_time.sd:.4f}) '
+                  'Data {data_time.val:.3f} (avg:{data_time.avg:.3f}, sd:{data_time.sd:.3f})  '
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})  '
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(epoch, i, len(train_loader),
+                    compute_time=compute_time, batch_time=batch_time,
+                    data_time=data_time, loss=losses, top1=top1, top5=top5))
+
+        count += 1
 
 
 def validate(val_loader, model, criterion):
@@ -255,8 +280,8 @@ def validate(val_loader, model, criterion):
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
             if args.gpu is not None:
-                input = input.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
+                input = tools.enable_half(input.cuda(args.gpu, non_blocking=True))
+            target = tools.enable_half(target.cuda(args.gpu, non_blocking=True))
 
             # compute output
             output = model(input)
@@ -294,21 +319,63 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 
 
 class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
+    """
+        Store the sum of the observations of the sum of the observation squared
+        The first few observations are discarded (usually slower than the rest)
+
+        The average and the standard deviation is computed at the user's request
+
+        In order to make the computation stable we store the first observation and subtract it to every other
+        observations. The idea is if x ~ N(mu, sigma)  x - x0 and the sum of x - x0 should be close(r) to 0 allowing
+        for greater precision; without that trick `var` was getting negative on some iteration.
+    """
+    def __init__(self, drop_first_obs=10):
         self.reset()
+        self.drop_obs = drop_first_obs
 
     def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+        self.sum = 0.0
+        self.sum_sqr = 0.0
+        self.current_count = 0
+        self.current_obs = 0
+        self.first_obs = 0
 
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+    def update(self, val, weight=1):
+        self.current_count += weight
+
+        if self.current_count < self.drop_obs:
+            self.current_obs = val
+            return
+
+        if self.count == 1:
+            self.first_obs = val
+
+        self.current_obs = val - self.first_obs
+        self.sum += float(self.current_obs) * float(weight)
+        self.sum_sqr += float(self.current_obs * self.current_obs) * float(weight)
+
+    @property
+    def val(self) -> float:
+        return self.current_obs + self.first_obs
+
+    @property
+    def count(self)-> int:
+        # is count is 0 then self.sum is 0 so everything should workout
+        return max(self.current_count - self.drop_obs, 1)
+
+    @property
+    def avg(self) -> float:
+        return self.sum / float(self.count) + self.first_obs
+
+    @property
+    def var(self) -> float:
+        avg = self.sum / float(self.count)
+        return self.sum_sqr / float(self.count) - avg * avg
+
+    @property
+    def sd(self) -> float:
+        return math.sqrt(self.var)
+
 
 
 def adjust_learning_rate(optimizer, epoch):
